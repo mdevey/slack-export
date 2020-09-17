@@ -1,4 +1,3 @@
-from slacker import Slacker, Conversations
 import json
 import argparse
 import os
@@ -10,72 +9,10 @@ import sys
 from datetime import datetime
 from pick import pick
 from time import sleep
+import functools
 
-# fetches the complete message history for a channel/group/im
-#
-# pageableObject could be:
-# slack.channel
-# slack.groups
-# slack.im
-#
-# channelId is the id of the channel/group/im you want to download history for.
-def getHistory(pageableObject, channelId, pageSize = 100):
-    messages = []
-    lastTimestamp = None
-
-    while(True):
-        try:
-            if isinstance(pageableObject, Conversations):
-                response = pageableObject.history(
-                    channel=channelId,
-                    latest=lastTimestamp,
-                    oldest=0,
-                    limit=pageSize
-                ).body
-            else:
-                response = pageableObject.history(
-                    channel = channelId,
-                    latest    = lastTimestamp,
-                    oldest    = 0,
-                    count     = pageSize
-                ).body
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                retryInSeconds = int(e.response.headers['Retry-After'])
-                print(u"Rate limit hit. Retrying in {0} second{1}.".format(retryInSeconds, "s" if retryInSeconds > 1 else ""))
-                sleep(retryInSeconds)
-                if isinstance(pageableObject, Conversations):
-                    response = pageableObject.history(
-                        channel=channelId,
-                        latest=lastTimestamp,
-                        oldest=0,
-                        limit=pageSize
-                    ).body
-                else:
-                    response = pageableObject.history(
-                        channel=channelId,
-                        latest=lastTimestamp,
-                        oldest=0,
-                        count=pageSize
-                    ).body
-
-
-        messages.extend(response['messages'])
-
-        if (response['has_more'] == True):
-            sys.stdout.write(".")
-            sys.stdout.flush()
-            lastTimestamp = messages[-1]['ts'] # -1 means last element in a list
-            sleep(1) # Respect the Slack API rate limit
-        else:
-            break
-    if lastTimestamp != None:
-        print("")
-
-    messages.sort(key = lambda message: message['ts'])
-
-    return messages
-
+from slack import WebClient
+from slack.errors import SlackApiError
 
 def mkdir(directory):
     if not os.path.isdir(directory):
@@ -127,9 +64,10 @@ def parseMessages( roomDir, messages, roomType ):
         #first store the date of the next message
         ts = parseTimeStamp( message['ts'] )
         fileDate = '{:%Y-%m-%d}'.format(ts)
+        threaded = ("parent_user_id" in message)
 
-        #if it's on a different day, write out the previous day's messages
-        if fileDate != currentFileDate:
+        #if it's on a different day (and not a thread reply), write out the previous day's messages
+        if fileDate != currentFileDate and not threaded:
             outFileName = u'{room}/{file}.json'.format( room = roomDir, file = currentFileDate )
             writeMessageFile( outFileName, currentMessages )
             currentFileDate = fileDate
@@ -167,9 +105,8 @@ def fetchPublicChannels(channels):
     for channel in channels:
         channelDir = channel['name'].encode('utf-8')
         print("Fetching history for Public Channel: {0}".format(channelDir))
-        channelDir = channel['name'].encode('utf-8')
         mkdir( channelDir )
-        messages = getHistory(slack.conversations, channel['id'])
+        messages = getEntireChannelHistory(channel['id'])
         parseMessages( channelDir, messages, 'channel')
 
 # write channels.json file
@@ -208,6 +145,78 @@ def promptForDirectMessages(dms):
     selectedDms = pick(dmNames, 'Select the 1:1 DMs you want to export:', multi_select=True)
     return [dms[index] for dmName, index in selectedDms]
 
+def guessListDataKey(obj, oldkey):
+    if oldkey:
+        return oldkey
+    #key messages channels, members, thing*s* etc.
+    for k in obj:
+        if isinstance(k, str) and k.endswith('s') and isinstance(obj[k], list):
+            return k
+
+#Gather all the paged data from a SlackResponse
+def get(func, datakey=None):
+    arr = []
+    for page in func(limit=999):
+        if page['ok']:
+            datakey = guessListDataKey(page.data, datakey)
+            print(datakey)
+            arr.extend(page[datakey])
+            #Some functions don't have 'has_more'
+            #if page['has_more']:
+            cursor = ''
+            meta = page["response_metadata"]
+            if meta:
+                cursor = meta["next_cursor"]
+            if not cursor == '':
+                sleep(1)
+            else:
+                break
+    return arr
+
+#May need this later if guessListDataKey starts failing with api change.
+#def getMessages(func):
+#    return get(func, datakey="messages")
+#def getMembers(func):
+#    return get(func, datakey="members")
+#def getChannels(func):
+#    return get(func, datakey="channels")
+
+def getThreadHistory(channel, ts):
+    global client
+    threadHistory = functools.partial(client.conversations_replies, channel=channel, ts=ts)
+    return get(threadHistory)
+
+def getChannelHistory(channel):
+    global client
+    channelHistory = functools.partial(client.conversations_history, channel=channel)
+    return get(channelHistory)
+
+def addThreadSummary(msgs):
+    itr = iter(msgs)
+    first = next(itr) # summary is needed here / step over it.
+    replies = []
+    for r in itr:
+        replies.append({"user": r["user"], "ts": r["ts"]})
+    # insert summary.
+    first["replies"] = replies
+
+def getEntireChannelHistory(channel):
+    messages = []
+    threadless = getChannelHistory(channel)
+    threadless.reverse()
+    for msg in threadless:
+        if "thread_ts" in msg:
+            #toss msg and get thread instead.
+            thread = getThreadHistory(channel, msg['thread_ts'])
+            addThreadSummary(thread)
+            messages.extend(thread)
+        else:
+            messages.append(msg)
+    #purists may consider sorting the messages here to disperse the thread replies
+    #to the correct date order.  I've instead opted to change the day splitting
+    #code in ParseMessages to not split on threaded messages.
+    return messages
+
 # fetch and write history for all direct message conversations
 # also known as IMs in the slack API.
 def fetchDirectMessages(dms):
@@ -223,8 +232,8 @@ def fetchDirectMessages(dms):
         print("Fetching 1:1 DMs with {0}".format(name))
         dmId = dm['id']
         mkdir(dmId)
-        messages = getHistory(slack.conversations, dm['id'])
-        parseMessages( dmId, messages, "im" )
+        messages = getEntireChannelHistory(dmId)
+        parseMessages(dmId, messages, "im" )
 
 def promptForGroups(groups):
     groupNames = [group['name'] for group in groups]
@@ -246,7 +255,7 @@ def fetchGroups(groups):
         mkdir(groupDir)
         messages = []
         print("Fetching history for Private Channel / Group DM: {0}".format(group['name']))
-        messages = getHistory(slack.conversations, group['id'])
+        messages = getEntireChannelHistory(group['id'])
         parseMessages( groupDir, messages, 'group' )
 
 # fetch all users for the channel and return a map userId -> userName
@@ -264,32 +273,51 @@ def dumpUserFile():
 
 # get basic info about the slack channel to ensure the authentication token works
 def doTestAuth():
-    testAuth = slack.auth.test().body
-    teamName = testAuth['team']
-    currentUser = testAuth['user']
-    print("Successfully authenticated for team {0} and user {1} ".format(teamName, currentUser))
-    return testAuth
+    global client
+    try:
+        auth = client.auth_test()
+        print("Successfully authenticated")
+        for k in auth.data:
+            if not k == 'ok':
+                print(k + ": " + str(auth.data[k]))
+        #TODO consider testing required permissions (screwed up permission list) api apps.permissions.users.list
+        return auth
+    except SlackApiError as e:
+        print("AUTHENTICATION FAILED!")
+        print("Create a new app at https://api.slack.com/apps")
+        print("Once created visit (https://api.slack.com/apps), click your app, and double check you are pasting the correct token")
+        print("Under 'Features' there is a 'OAuth & Permissions' link")
+        print("This should take you to Webpage specific to your 'app' something like https://api.slack.com/apps/{ADEADBEEF}/oauth")
+        print("Copy/Check the 'OAuth Access Token' and give to this script ")
+        print("DO NOT SHARE THIS TOKEN WITH ANYONE (it gives access to your PRIVATE conversations)")
+        print("eg\tpython3 slack_export.py --token xoxp-12341234-XXXXX-XXXXX-deadbeef")
+        exit(-1)
 
-# Since Slacker does not Cache.. populate some reused lists
 def bootstrapKeyValues():
-    global users, channels, groups, dms
-    users = slack.users.list().body['members']
+    global users, channels, groups, dms, client
+    users = get(client.users_list)
     print("Found {0} Users".format(len(users)))
     sleep(1)
     
-    channels = slack.conversations.list(limit = 1000, types=('public_channel')).body['channels']
+    publicChannels = functools.partial(client.conversations_list, types=('public_channel'))
+    channels = get(publicChannels)
     print("Found {0} Public Channels".format(len(channels)))
     sleep(1)
 
-    groups = slack.conversations.list(limit = 1000, types=('private_channel', 'mpim')).body['channels']
+    privateChannels = functools.partial(client.conversations_list, types=('private_channel,mpim'))
+    groups = get(privateChannels)
     print("Found {0} Private Channels or Group DMs".format(len(groups)))
     # need to retrieve channel memberships for the slack-export-viewer to work
     for n in range(len(groups)):
-        groups[n]["members"] = slack.conversations.members(limit=1000, channel=groups[n]['id']).body['members']
-        print("Retrieved members of {0}".format(groups[n]['name']))
+        group = groups[n]
+        members = functools.partial(client.conversations_members, channel=group['id'])
+        m = get(members)
+        group["members"] = m
+        print("Retrieved {0} members of {1}".format(len(m), group['name']))
     sleep(1)
 
-    dms = slack.conversations.list(limit = 1000, types=('im')).body['channels']
+    dm = functools.partial(client.conversations_list, types=('im'))
+    dms = get(dm)
     print("Found {0} 1:1 DM conversations\n".format(len(dms)))
     sleep(1)
 
@@ -327,13 +355,18 @@ def finalize():
     if zipName:
         shutil.make_archive(zipName, 'zip', outputDirectory, None)
         shutil.rmtree(outputDirectory)
-    exit()
+        print("Created: " + zipName + ".zip")
+    else:
+        print("Created: " + outputDirectory)
+    #TODO see if we can do it with api auth.revoke
+    print("Go back to https://api.slack.com/apps/, select your app, click `Basic Information`, scroll to the bottom and click the red 'Delete App' button")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Export Slack history')
 
     parser.add_argument('--token', required=True, help="Slack API token")
     parser.add_argument('--zip', help="Name of a zip file to output as")
+    #parser.add_argument('--files', help="Fetch files also (careful big and slow)")
 
     parser.add_argument(
         '--dryRun',
@@ -376,8 +409,8 @@ if __name__ == "__main__":
     dms = []
     userNamesById = {}
     userIdsByName = {}
+    client = WebClient(token=args.token)
 
-    slack = Slacker(args.token)
     testAuth = doTestAuth()
     tokenOwnerId = testAuth['user_id']
 

@@ -64,10 +64,9 @@ def parseMessages( roomDir, messages, roomType ):
         #first store the date of the next message
         ts = parseTimeStamp( message['ts'] )
         fileDate = '{:%Y-%m-%d}'.format(ts)
-        threaded = ("parent_user_id" in message)
 
-        #if it's on a different day (and not a thread reply), write out the previous day's messages
-        if fileDate != currentFileDate and not threaded:
+        #if it's on a different day, write out the previous day's messages
+        if fileDate != currentFileDate:
             outFileName = u'{room}/{file}.json'.format( room = roomDir, file = currentFileDate )
             writeMessageFile( outFileName, currentMessages )
             currentFileDate = fileDate
@@ -103,7 +102,7 @@ def fetchPublicChannels(channels):
         return
 
     for channel in channels:
-        channelDir = channel['name'].encode('utf-8')
+        channelDir = channel['name']
         print("Fetching history for Public Channel: {0}".format(channelDir))
         mkdir( channelDir )
         messages = getEntireChannelHistory(channel['id'])
@@ -148,7 +147,7 @@ def promptForDirectMessages(dms):
 def guessListDataKey(obj, oldkey):
     if oldkey:
         return oldkey
-    #key messages channels, members, thing*s* etc.
+    #key messages, channels, members, thing*s* etc.
     for k in obj:
         if isinstance(k, str) and k.endswith('s') and isinstance(obj[k], list):
             return k
@@ -156,21 +155,37 @@ def guessListDataKey(obj, oldkey):
 #Gather all the paged data from a SlackResponse
 def get(func, datakey=None):
     arr = []
-    for page in func(limit=999):
-        if page['ok']:
-            datakey = guessListDataKey(page.data, datakey)
-            print(datakey)
-            arr.extend(page[datakey])
-            #Some functions don't have 'has_more'
-            #if page['has_more']:
-            cursor = ''
-            meta = page["response_metadata"]
-            if meta:
-                cursor = meta["next_cursor"]
-            if not cursor == '':
+    try:
+        i = 0
+        for page in func(limit=1000):
+            #TODO don't think you can hit this page['ok'] false throws exception.
+            i += 1
+            if page['ok']:
+                datakey = guessListDataKey(page.data, datakey)
+                arr.extend(page[datakey])
+                sys.stdout.write('.')
+                if i % 40 == 0:
+                    print("")
+                else:
+                    sys.stdout.flush()
+
+                #Some functions don't have 'has_more'
+                #if page['has_more']:
+                cursor = ''
+                meta = page["response_metadata"]
+                if meta:
+                    cursor = meta["next_cursor"]
                 sleep(1)
-            else:
-                break
+                if cursor == '':
+                    break
+    except SlackApiError as e:
+        print(e)
+        data = e.response.data
+        if data['error'] == 'missing_scope':
+            print("Your OAuth Token at http://api.slack.com/apps is missing permission:  " + data['needed'])
+            print(data['needed'] + " permission can be added to the 'OAuth & Permissions' page, then click 'Reinstall App' at the top of the page.")
+        exit(-1)
+    print(' ' + str(len(arr)) + ' ' + datakey)
     return arr
 
 #May need this later if guessListDataKey starts failing with api change.
@@ -183,38 +198,47 @@ def get(func, datakey=None):
 
 def getThreadHistory(channel, ts):
     global client
+    print("Get thread history for " + channel + " at " + ts)
     threadHistory = functools.partial(client.conversations_replies, channel=channel, ts=ts)
     return get(threadHistory)
 
 def getChannelHistory(channel):
     global client
+    print("Get history for " + channel)
     channelHistory = functools.partial(client.conversations_history, channel=channel)
     return get(channelHistory)
 
+#This is unused by changes by mdevey to _build_threads reader.py but useful to legacy slack-export-viewer.
 def addThreadSummary(msgs):
     itr = iter(msgs)
     first = next(itr) # summary is needed here / step over it.
     replies = []
     for r in itr:
-        replies.append({"user": r["user"], "ts": r["ts"]})
+        if 'user' in r:
+            user = r['user']
+        if 'bot_id' in r:
+            user = r['bot_id']
+        replies.append({"user": user, "ts": r["ts"]})
     # insert summary.
     first["replies"] = replies
 
 def getEntireChannelHistory(channel):
     messages = []
     threadless = getChannelHistory(channel)
-    threadless.reverse()
+    #threadless.sort(key = lambda m: m['ts'])
+
     for msg in threadless:
-        if "thread_ts" in msg:
+         # alternatively never get the thread for a 'subtype': 'thread_broadcast'
+        if "thread_ts" in msg and msg['ts'] == msg['thread_ts']:
             #toss msg and get thread instead.
             thread = getThreadHistory(channel, msg['thread_ts'])
             addThreadSummary(thread)
             messages.extend(thread)
         else:
             messages.append(msg)
-    #purists may consider sorting the messages here to disperse the thread replies
-    #to the correct date order.  I've instead opted to change the day splitting
-    #code in ParseMessages to not split on threaded messages.
+
+    messages.sort(key = lambda m: m['ts'])
+
     return messages
 
 # fetch and write history for all direct message conversations
@@ -280,8 +304,6 @@ def doTestAuth():
         for k in auth.data:
             if not k == 'ok':
                 print(k + ": " + str(auth.data[k]))
-        #TODO consider testing required permissions (screwed up permission list) api apps.permissions.users.list
-        return auth
     except SlackApiError as e:
         print("AUTHENTICATION FAILED!")
         print("Create a new app at https://api.slack.com/apps")
@@ -292,6 +314,15 @@ def doTestAuth():
         print("DO NOT SHARE THIS TOKEN WITH ANYONE (it gives access to your PRIVATE conversations)")
         print("eg\tpython3 slack_export.py --token xoxp-12341234-XXXXX-XXXXX-deadbeef")
         exit(-1)
+
+    #TODO consider testing ALL required permissions (screwed up permission list, eg missed users:read ),
+    #So we don't have to wait until get() is called late in the script.
+    #All the *.permission.* calls I can find don't appear to work with a user token
+    #https://api.slack.com/methods/apps.permissions.users.list I'm doing it wrong!
+    #perms = client.api_call("apps.permissions.info")
+    #print(perms)
+
+    return auth
 
 def bootstrapKeyValues():
     global users, channels, groups, dms, client
@@ -352,12 +383,15 @@ def dumpDummyChannel():
 
 def finalize():
     os.chdir('..')
+    output = ""
     if zipName:
         shutil.make_archive(zipName, 'zip', outputDirectory, None)
         shutil.rmtree(outputDirectory)
-        print("Created: " + zipName + ".zip")
+        output = zipName + ".zip"
     else:
-        print("Created: " + outputDirectory)
+        output = outputDirectory
+    print("Created: " + output)
+    print("typical next step: slack-export-viewer -z {logs}".format(logs=output))
     #TODO see if we can do it with api auth.revoke
     print("Go back to https://api.slack.com/apps/, select your app, click `Basic Information`, scroll to the bottom and click the red 'Delete App' button")
 

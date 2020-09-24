@@ -306,7 +306,7 @@ def doTestAuth():
                 print(k + ": " + str(auth.data[k]))
     except SlackApiError as e:
         print("AUTHENTICATION FAILED!")
-        print("Create a new app at https://api.slack.com/apps")
+        print("Create a new app (or Reinstall an old app and copy a new token) at https://api.slack.com/apps")
         print("Once created visit (https://api.slack.com/apps), click your app, and double check you are pasting the correct token")
         print("Under 'Features' there is a 'OAuth & Permissions' link")
         print("This should take you to Webpage specific to your 'app' something like https://api.slack.com/apps/{ADEADBEEF}/oauth")
@@ -381,7 +381,27 @@ def dumpDummyChannel():
     outFileName = u'{room}/{file}.json'.format( room = channelName, file = fileDate )
     writeMessageFile(outFileName, [])
 
+def promptRevokeToken():
+    title = 'Question: Would you like to protect your account and disable --token xoxp-<secret-password-hex> !!! equivalent to username & password !!!: '
+    options = [
+        'yes, I want to protect my account, I will visit https://api.slack.com/apps/ to enable again if needed', 
+        'no, I just did a testrun and will use it again soon, I realise this is unsafe and will disable it next time'
+    ]
+    option, index = pick(options, title)
+    doRevoke=(index==0)
+    return doRevoke
+
+def revokeToken():
+    global client
+    response = client.auth_revoke()
+    if response['ok']:
+        print("Token is revoked, visit https://api.slack.com/apps/ hit green 'Reinstall App' button and copy a new token to use.")
+    else:
+        print(response)
+        print("Failed to revoke")
+
 def finalize():
+
     os.chdir('..')
     output = ""
     if zipName:
@@ -392,8 +412,12 @@ def finalize():
         output = outputDirectory
     print("Created: " + output)
     print("typical next step: slack-export-viewer -z {logs}".format(logs=output))
-    #TODO see if we can do it with api auth.revoke
-    print("Go back to https://api.slack.com/apps/, select your app, click `Basic Information`, scroll to the bottom and click the red 'Delete App' button")
+
+    if promptRevokeToken():
+        revokeToken()
+    else:
+        print("Token is still active! visit https://api.slack.com/apps/, select your app, click `Basic Information`, scroll to the bottom and click the red 'Delete App' button")
+        print("Alternatively rerun this script with --revokeAccessDoNothing")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Export Slack history')
@@ -435,6 +459,12 @@ if __name__ == "__main__":
         default=False,
         help="Prompt you to select the conversations to export")
 
+    parser.add_argument(
+        '--revokeAccessDoNothing',
+        action='store_true',
+        default=False,
+        help="revoke the --token given and exit, nothing is downloaded, token is locked out")
+
     args = parser.parse_args()
 
     users = []    
@@ -444,8 +474,12 @@ if __name__ == "__main__":
     userNamesById = {}
     userIdsByName = {}
     client = WebClient(token=args.token)
-
     testAuth = doTestAuth()
+
+    if args.revokeAccessDoNothing:
+        revokeToken()
+        exit(0)
+
     tokenOwnerId = testAuth['user_id']
 
     bootstrapKeyValues()

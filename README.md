@@ -31,7 +31,7 @@ https://api.slack.com/custom-integrations/legacy-tokens
 
 ## Dependencies
 ```
-pip install slacker # https://github.com/os/slacker
+pip install slackclient # https://slack.dev/python-slackclient
 pip install pick # https://github.com/wong2/pick
 ```
 

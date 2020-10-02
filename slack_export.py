@@ -316,6 +316,57 @@ def doTestAuth():
 
     return auth
 
+# Determine if the token has sufficient permissions for the rest of the script.
+def doPermissionTest(requiredPermissions):
+    global client
+
+    #All the *.permission.* calls I can find don't appear to work with a user token
+    #https://api.slack.com/methods/apps.permissions.users.list I'm doing it wrong!
+    #perms = client.api_call("apps.permissions.info")
+    #print(perms)
+    #
+    #So instead test against permissions rarely given that does disclose token permissions.
+    provided = []
+    try:
+        auth = client.admin_inviteRequests_denied_list()
+        print("Woops, token has permission for admin_inviteRequests_denied_list (lucky you!)")
+        print("You will find out later if any permissions are lacking for other api calls in this script...")
+        return
+        #TODO find another test or the actual method to get provided permissions.
+    except SlackApiError as e:
+        #print(e)
+        data = e.response.data
+        if data['error'] == 'missing_scope':
+            if 'provided' in data:
+                provided = data['provided'].split(',')
+    missing = []
+    for p in requiredPermissions:
+        if p not in provided:
+            missing.append(p)
+
+    if len(missing) > 0:
+        print("Token provides the following permissions:")
+        print(provided)
+
+        xtra = set(provided) - set(requiredPermissions) - set(['identify'])
+        print("Token provides extra permissions (not a problem) this script should not need them:")
+        print(list(xtra))
+
+        print("Missing permissions (user token scopes):")
+        print("---")
+        print(missing)
+        print("---")
+        print("Head back to https://api.slack.com/apps/ and add the above permissions to the token.")
+        print("Be careful of the faulty autocompletion!")
+        print("GOTCHA!  User types in:            'users:read'")
+        print("         1st recommendation: 'admin.users:read'  (If you press enter this is what you get!!!)")
+        print("         2nd recommendation:       'users:read'")
+
+        #TODO give an option to try anyway (permissions may change)...
+        exit(1)
+    else:
+        print("All expected permissions (user token scopes) found.")
+
 def readCachedJson(file):
     global readTmpDir
     if readTmpDir:
@@ -528,6 +579,19 @@ def Main(argsin):
     reconnectClient(args.token)
     testAuth = doTestAuth()
     tokenOwnerId = testAuth['user_id']
+    requiredPermissions= [
+        'channels:history',
+        'channels:read',
+        #'files:read',  #Not yet but soon.
+        'groups:history',
+        'groups:read',
+        'im:history',
+        'im:read',
+        'mpim:history',
+        'mpim:read',
+        'users:read'
+    ]
+    doPermissionTest(requiredPermissions)
 
     if args.revokeAccessDoNothing:
         revokeToken()
